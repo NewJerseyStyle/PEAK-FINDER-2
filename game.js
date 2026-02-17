@@ -455,7 +455,8 @@ class Game {
         this.winStars = 0;
         this.optimizerPathName = null;
         // Difficulty: 'dummy' (terrain visible), 'normal' (terrain hidden), 'hard' (no heatmap + tight scoring)
-        this.difficulty = 'dummy';
+        this.difficulty = 'normal';
+        this.remoteDifficulty = 'normal';
         // 3D active slice: which plane arrow keys control
         this.activeSlice = 'XY'; // 'XY', 'XZ', 'YZ'
         // Player progress / save data
@@ -463,6 +464,8 @@ class Game {
         this.maxLevelPassed = 0; // highest level completed
         this.levelStars = {}; // { levelNum: bestStars }
         this.loadProgress();
+
+        this.revealedGrid = new Uint8Array(100 * 100); // 50x50 units per cell, 100x100 = 5000x5000 units
 
         this.inpPower = document.getElementById('inpPower');
         this.inpPower.oninput = (e) => { this.power = parseInt(e.target.value); document.getElementById('valPower').textContent = this.power; };
@@ -503,8 +506,10 @@ class Game {
     connectToPeer() {
         if (this.conn && this.conn.open) {
             // If already connected, this button can act as a "Start Match"
-            if (this.multiplayerMode !== this.remoteMultiplayerMode) {
-                alert(`Players picked different modes!\nYOU: ${this.multiplayerMode.toUpperCase()}\nFRIEND: ${this.remoteMultiplayerMode.toUpperCase()}\nPlease negotiate to play which one.`);
+            if (this.multiplayerMode !== this.remoteMultiplayerMode || this.difficulty !== this.remoteDifficulty) {
+                alert(`Players must agree on both Mode and Difficulty!\n` +
+                      `MODE: YOU(${this.multiplayerMode.toUpperCase()}) vs FRIEND(${this.remoteMultiplayerMode.toUpperCase()})\n` +
+                      `DIFF: YOU(${this.difficulty.toUpperCase()}) vs FRIEND(${this.remoteDifficulty.toUpperCase()})`);
                 return;
             }
             if (this.isHost) {
@@ -538,6 +543,7 @@ class Game {
             
             // Sync current selection
             this.sendMPData({ type: 'MODE_SYNC', mode: this.multiplayerMode });
+            this.sendMPData({ type: 'DIFF_SYNC', diff: this.difficulty });
             this.updateMPMenuUI();
             
             if (this.isHost) {
@@ -551,9 +557,50 @@ class Game {
 
         this.conn.on('close', () => {
             document.getElementById('mpStatus').textContent = 'CONNECTION CLOSED';
+            this.handleDisconnect('The other player has derezzed.');
             this.conn = null;
             document.getElementById('remoteWindow').classList.add('hidden');
         });
+    }
+
+    handleDisconnect(baseMsg) {
+        if (this.state === 'MENU') return; // Don't show if already in menu
+        
+        const tronMsgs = [
+            "THE OTHER PLAYER HAS BEEN CAPTURED BY SARK. YOU ARE BEING SENT BACK TO 0-D...",
+            "MASTER CONTROL PROGRAM INTERRUPTED THE GAME. CONNECTION LOST. REBOOTING SYSTEM...",
+            "DIMENSIONAL SYNC FAILURE: YOUR TEAMMATE DEREZZED. RETURNING TO GRID PERIMETER...",
+            "USER DISCONNECTED FROM THE SYSTEM. SARK SAYS: END OF LINE.",
+            "COMMUNICATION LINK DEGRADED. MCP IS PURGING THE CURRENT SECTOR..."
+        ];
+        
+        const selectedMsg = tronMsgs[Math.floor(Math.random() * tronMsgs.length)] || baseMsg;
+        
+        this.state = 'DISCONNECTED';
+        const screen = document.getElementById('disconnectScreen');
+        const msgEl = document.getElementById('dcMessage');
+        const countEl = document.getElementById('dcCountdown');
+        
+        // Hide all other overlays
+        document.querySelectorAll('.overlay-screen').forEach(s => s.classList.add('hidden'));
+        document.getElementById('hud').classList.add('hidden');
+        
+        screen.classList.remove('hidden');
+        msgEl.textContent = selectedMsg;
+        
+        let count = 10;
+        countEl.textContent = count;
+        
+        if (this._dcTimer) clearInterval(this._dcTimer);
+        this._dcTimer = setInterval(() => {
+            count--;
+            if (countEl) countEl.textContent = count;
+            if (count <= 0) {
+                clearInterval(this._dcTimer);
+                this._dcTimer = null;
+                this.showMenu();
+            }
+        }, 1000);
     }
 
     sendMPData(data) {
@@ -571,6 +618,21 @@ class Game {
             case 'MODE_SYNC':
                 this.remoteMultiplayerMode = data.mode;
                 this.updateMPMenuUI();
+                break;
+            case 'DIFF_SYNC':
+                this.remoteDifficulty = data.diff;
+                this.updateMPMenuUI();
+                break;
+            case 'TERRAIN_SYNC':
+                const lvl = LEVELS[data.levelNum - 1];
+                lvl.terrain = data.terrain;
+                lvl.spawnPos = data.spawnPos;
+                lvl.minStepsRequired = data.minStepsRequired;
+                lvl.dynamicTarget = data.dynamicTarget;
+                if (this._terrainSyncResolver) {
+                    this._terrainSyncResolver();
+                    this._terrainSyncResolver = null;
+                }
                 break;
             case 'START_MATCH':
                 this.mpLevelQueue = data.levels;
@@ -592,6 +654,7 @@ class Game {
                 this.remotePos = data.pos;
                 this.remoteSteps = data.steps;
                 this.remoteHeight = data.h;
+                this.markRevealed(data.pos.x, data.pos.y, data.pos.z);
                 this.remoteHistory.push({ ...data.pos, h: data.h });
                 if (this.remoteHistory.length > 500) this.remoteHistory.shift();
                 break;
@@ -611,8 +674,36 @@ class Game {
                 if (this.state === 'WIN' && this.multiplayerMode === 'casual') {
                     // Update win screen with remote results
                     const content = document.getElementById('winContent');
-                    content.innerHTML += `<div style="font-size:12px;color:#ff6b9d;margin-top:5px;">${this.remotePlayerName} finished in ${data.steps} steps.</div>`;
+                    const existingRemoteResult = document.getElementById('remoteResult');
+                    const resultHtml = `<div id="remoteResult" style="font-size:12px;color:#ff6b9d;margin-top:5px;">${this.remotePlayerName} finished in ${data.steps} steps.</div>`;
+                    if (existingRemoteResult) existingRemoteResult.outerHTML = resultHtml;
+                    else content.innerHTML += resultHtml;
                 }
+
+                // If we are in casual and opponent wins first, we must stop and see results
+                if (this.multiplayerMode === 'casual' && this.state === 'PLAYING') {
+                    this.state = 'WIN'; // Force stop
+                    this.win(); // Trigger win screen which now shows results
+                }
+
+                // Campaign: start countdown if we are already in win screen
+                if (this.state === 'WIN' && this.multiplayerMode === 'campaign') {
+                    const targetH = this.currentLevel.dynamicTarget || (this.terrain ? this.terrain.maxHeight * 0.985 : 100);
+                    if (this.remoteHeight >= targetH) {
+                        this.startMPWinCountdown();
+                    }
+                }
+                break;
+            case 'LEVEL_RESTART':
+                this.showHint(`${this.remotePlayerName} RESTARTED LEVEL`);
+                this.resetLevel(true); // Internal reset without broadcasting back
+                break;
+            case 'CASUAL_FINISH':
+                this.showFinalMPResults();
+                break;
+            case 'MP_NEXT_LEVEL':
+                this.mpCurrentLevelIdx = data.index;
+                this.startMPSync();
                 break;
         }
     }
@@ -628,7 +719,17 @@ class Game {
         this.updateMPMenuUI();
         this.sendMPData({ type: 'MODE_SYNC', mode: mode });
         
-        if (this.isHost && this.multiplayerMode === this.remoteMultiplayerMode) {
+        if (this.isHost && this.multiplayerMode === this.remoteMultiplayerMode && this.difficulty === this.remoteDifficulty) {
+            this.generateMPMatch();
+        }
+    }
+
+    setMPDifficulty(diff) {
+        this.setDifficulty(diff);
+        this.updateMPMenuUI();
+        this.sendMPData({ type: 'DIFF_SYNC', diff: diff });
+
+        if (this.isHost && this.multiplayerMode === this.remoteMultiplayerMode && this.difficulty === this.remoteDifficulty) {
             this.generateMPMatch();
         }
     }
@@ -637,21 +738,105 @@ class Game {
         const btnCausal = document.getElementById('btnMPCausal');
         const btnCampaign = document.getElementById('btnMPCampaign');
         
-        // Reset backgrounds
+        // Helper to add player indicators to buttons
+        const setButtonIndicators = (btn, isLocal, isRemote) => {
+            // Remove existing indicators
+            const existing = btn.querySelectorAll('.mp-indicator');
+            existing.forEach(e => e.remove());
+
+            if (isLocal || isRemote) {
+                const container = document.createElement('div');
+                container.className = 'mp-indicator';
+                container.style.cssText = 'position:absolute; top:-12px; left:0; width:100%; display:flex; justify-content:center; gap:4px; pointer-events:none;';
+                
+                if (isLocal) {
+                    const localTag = document.createElement('span');
+                    localTag.textContent = 'YOU';
+                    localTag.style.cssText = 'background:#4ecca3; color:#000; font-size:7px; padding:1px 4px; border-radius:2px; font-weight:bold;';
+                    container.appendChild(localTag);
+                }
+                if (isRemote) {
+                    const remoteTag = document.createElement('span');
+                    remoteTag.textContent = 'FRIEND';
+                    remoteTag.style.cssText = 'background:#ff6b9d; color:#000; font-size:7px; padding:1px 4px; border-radius:2px; font-weight:bold;';
+                    container.appendChild(remoteTag);
+                }
+                btn.style.position = 'relative';
+                btn.appendChild(container);
+            }
+        };
+
+        // Update Mode Buttons
         btnCausal.style.background = 'transparent';
         btnCampaign.style.background = 'transparent';
         
-        // Highlight local selection
-        if (this.multiplayerMode === 'casual') btnCausal.style.background = 'rgba(78, 204, 163, 0.2)';
-        if (this.multiplayerMode === 'campaign') btnCampaign.style.background = 'rgba(78, 204, 163, 0.2)';
+        const localMode = this.multiplayerMode;
+        const remoteMode = this.remoteMultiplayerMode;
+
+        setButtonIndicators(btnCausal, localMode === 'casual', remoteMode === 'casual');
+        setButtonIndicators(btnCampaign, localMode === 'campaign', remoteMode === 'campaign');
+
+        if (localMode === 'casual') btnCausal.style.background = 'rgba(255, 204, 78, 0.2)';
+        if (localMode === 'campaign') btnCampaign.style.background = 'rgba(255, 107, 157, 0.2)';
         
-        // If both agree, highlight in a distinct way (already using green-ish transparent)
-        if (this.multiplayerMode === this.remoteMultiplayerMode) {
-            if (this.multiplayerMode === 'casual') btnCausal.style.background = 'rgba(34, 204, 83, 0.4)';
-            if (this.multiplayerMode === 'campaign') btnCampaign.style.background = 'rgba(34, 204, 83, 0.4)';
-            document.getElementById('mpStatus').textContent = 'BOTH PLAYERS AGREED ON ' + this.multiplayerMode.toUpperCase();
+        if (localMode === remoteMode) {
+            if (localMode === 'casual') btnCausal.style.background = 'rgba(255, 204, 78, 0.5)';
+            if (localMode === 'campaign') btnCampaign.style.background = 'rgba(255, 107, 157, 0.5)';
+        }
+
+        // Update Difficulty Buttons
+        ['Dummy', 'Normal', 'Hard'].forEach(d => {
+            const btn = document.getElementById('btnMPDiff' + d);
+            if (!btn) return;
+            const diffValue = d.toLowerCase();
+            btn.style.background = 'transparent';
+            
+            const isLocal = this.difficulty === diffValue;
+            const isRemote = this.remoteDifficulty === diffValue;
+
+            setButtonIndicators(btn, isLocal, isRemote);
+
+            if (isLocal) {
+                const color = diffValue === 'dummy' ? 'rgba(78, 204, 163, 0.2)' : (diffValue === 'normal' ? 'rgba(255, 204, 78, 0.2)' : 'rgba(255, 107, 107, 0.2)');
+                btn.style.background = color;
+            }
+            
+            if (isLocal && isRemote) {
+                const color = diffValue === 'dummy' ? 'rgba(78, 204, 163, 0.5)' : (diffValue === 'normal' ? 'rgba(255, 204, 78, 0.5)' : 'rgba(255, 107, 107, 0.5)');
+                btn.style.background = color;
+            }
+        });
+        
+        // Status message
+        const modeMatch = this.multiplayerMode === this.remoteMultiplayerMode;
+        const diffMatch = this.difficulty === this.remoteDifficulty;
+        const isConnected = this.conn && this.conn.open;
+        const btnConnect = document.querySelector('button[onclick="game.connectToPeer()"]');
+
+        if (isConnected) {
+            if (this.isHost) {
+                btnConnect.textContent = 'START MATCH';
+                btnConnect.style.display = 'inline-block';
+                btnConnect.style.borderColor = (modeMatch && diffMatch) ? '#4ecca3' : '#666';
+            } else {
+                btnConnect.style.display = 'none';
+            }
         } else {
-            document.getElementById('mpStatus').textContent = 'WAITING FOR FRIEND TO AGREE ON ' + this.multiplayerMode.toUpperCase();
+            btnConnect.textContent = 'CONNECT TO FRIEND';
+            btnConnect.style.display = 'inline-block';
+            btnConnect.style.borderColor = '#4ecca3';
+        }
+
+        if (modeMatch && diffMatch) {
+            document.getElementById('mpStatus').textContent = 'ALL SYSTEMS GO! CLICK "CONNECT TO FRIEND" TO START.';
+            document.getElementById('mpStatus').style.color = '#4ecca3';
+        } else {
+            let msg = 'WAITING FOR FRIEND TO AGREE ON ';
+            if (!modeMatch && !diffMatch) msg += 'MODE AND DIFFICULTY';
+            else if (!modeMatch) msg += 'MODE (' + this.multiplayerMode.toUpperCase() + ')';
+            else msg += 'DIFFICULTY (' + this.difficulty.toUpperCase() + ')';
+            document.getElementById('mpStatus').textContent = msg;
+            document.getElementById('mpStatus').style.color = '#ffcc4e';
         }
     }
 
@@ -661,7 +846,10 @@ class Game {
         let queue = [];
         if (mode === 'casual') {
             for (let i = 0; i < 10; i++) {
-                queue.push(Math.floor(Math.random() * TOTAL_LEVELS) + 1);
+                const num = Math.floor(Math.random() * TOTAL_LEVELS) + 1;
+                queue.push(num);
+                // Clear existing terrain to ensure fresh generation (synced across players)
+                if (LEVELS[num - 1]) LEVELS[num - 1].terrain = null;
             }
         } else {
             // Campaign starts from level 1 or current progress
@@ -687,9 +875,31 @@ class Game {
 
     async loadMPLevel(num) {
         this.currentLevel = LEVELS[num - 1];
-        if (!this.currentLevel.terrain) {
-            await this.generateTerrainForLevel(this.currentLevel);
+        document.getElementById('winScreen').classList.add('hidden'); // Ensure score screen hides between matches
+        
+        if (this.isHost) {
+            // Generate terrain on host
+            if (!this.currentLevel.terrain) {
+                await this.generateTerrainForLevel(this.currentLevel);
+            }
+            // Send to client
+            this.sendMPData({
+                type: 'TERRAIN_SYNC',
+                levelNum: num,
+                terrain: this.currentLevel.terrain,
+                spawnPos: this.currentLevel.spawnPos,
+                minStepsRequired: this.currentLevel.minStepsRequired,
+                dynamicTarget: this.currentLevel.dynamicTarget
+            });
+        } else {
+            // Wait for TERRAIN_SYNC from host
+            if (!this.currentLevel.terrain) {
+                await new Promise(resolve => {
+                    this._terrainSyncResolver = resolve;
+                });
+            }
         }
+
         this.terrain = this.currentLevel.terrain;
         this.pos = { ...this.currentLevel.spawnPos };
         this.remotePos = { ...this.currentLevel.spawnPos };
@@ -901,6 +1111,10 @@ class Game {
             const btn = document.getElementById('diff' + d.charAt(0).toUpperCase() + d.slice(1));
             if (btn) btn.style.background = d === diff ? 'rgba(78,204,163,0.2)' : 'transparent';
         });
+        // Sync if in multiplayer
+        if (this.conn && this.conn.open) {
+            this.sendMPData({ type: 'DIFF_SYNC', diff: diff });
+        }
     }
 
     // --- Shared optimizer simulation (used by both verify and replay) ---
@@ -1066,6 +1280,19 @@ class Game {
         this.nextLevelPromise = this.generateTerrainForLevel(nextLevel);
     }
 
+    markRevealed(x, y, z) {
+        const gx = Math.floor(x / 50);
+        const gy = Math.floor(y / 50);
+        const radius = 3; // reveal a bit around the player
+        for (let ix = gx - radius; ix <= gx + radius; ix++) {
+            for (let iy = gy - radius; iy <= gy + radius; iy++) {
+                if (ix >= 0 && ix < 100 && iy >= 0 && iy < 100) {
+                    this.revealedGrid[ix + iy * 100] = 1;
+                }
+            }
+        }
+    }
+
     // --- Start Level ---
     async startLevel(num, isRestart = false) {
         if (num > TOTAL_LEVELS) { this.showTronEnding(); return; }
@@ -1073,10 +1300,17 @@ class Game {
         const detailDiv = document.getElementById('levelDetails');
         let hintInterval = null;
 
+        // Reset grid
+        this.revealedGrid.fill(0);
+
         // Hide win/replay UI
         document.getElementById('winScreen').classList.add('hidden');
         document.getElementById('replayBanner').classList.add('hidden');
         this.replayState = null;
+        if (this._mpAutoSyncTimer) {
+            clearInterval(this._mpAutoSyncTimer);
+            this._mpAutoSyncTimer = null;
+        }
 
         // Generate terrain if needed (skip if pre-generated or restart)
         if (!this.currentLevel.terrain) {
@@ -1109,6 +1343,7 @@ class Game {
         }
         this.terrain = this.currentLevel.terrain;
         this.pos = { ...this.currentLevel.spawnPos };
+        this.markRevealed(this.pos.x, this.pos.y, this.pos.z);
 
         if (hintInterval) clearInterval(hintInterval);
 
@@ -1173,10 +1408,16 @@ class Game {
         this.camera = { x: this.pos.x, y: this.pos.y, z: this.pos.z, h: h0 };
     }
 
-    resetLevel() {
+    resetLevel(fromRemote = false) {
         document.getElementById('winScreen').classList.add('hidden');
         document.getElementById('replayBanner').classList.add('hidden');
         this.replayState = null;
+        
+        // In multiplayer, if anyone restarts, both should restart
+        if (!fromRemote && this.conn && this.conn.open) {
+            this.sendMPData({ type: 'LEVEL_RESTART' });
+        }
+        
         if (this.currentLevel) this.startLevel(this.currentLevel.level, true);
     }
 
@@ -1189,12 +1430,14 @@ class Game {
     showMenu() {
         this.state = 'MENU';
         this.replayState = null;
+        if (this._dcTimer) { clearInterval(this._dcTimer); this._dcTimer = null; }
         document.getElementById('hud').classList.add('hidden');
         document.getElementById('pauseScreen').classList.add('hidden');
         document.getElementById('levelSelectScreen').classList.add('hidden');
         document.getElementById('winScreen').classList.add('hidden');
         document.getElementById('replayBanner').classList.add('hidden');
         document.getElementById('rankingScreen').classList.add('hidden');
+        document.getElementById('disconnectScreen').classList.add('hidden');
         document.getElementById('tronEnding').classList.add('hidden');
         document.getElementById('tronText').style.display = 'none';
         document.getElementById('tronButtons').style.display = 'none';
@@ -1430,6 +1673,8 @@ class Game {
         this.pos.x = newX; this.pos.y = newY; this.pos.z = newZ;
         this.steps++;
 
+        this.markRevealed(this.pos.x, this.pos.y, this.pos.z);
+
         const h = this.generator.getHeight(this.terrain, this.pos.x, this.pos.y, this.pos.z);
         this.history.push({ x: this.pos.x, y: this.pos.y, z: this.pos.z, h: h });
         
@@ -1535,13 +1780,25 @@ class Game {
         btnWatch.textContent = `WATCH ${optName} SOLVE`;
         
         const btnNext = document.getElementById('btnNextLevel');
-        if (this.multiplayerMode === 'campaign') {
-            btnNext.textContent = lvl >= TOTAL_LEVELS ? 'ESCAPE THE GRID (WAITING FOR FRIEND)' : 'NEXT LEVEL';
-            // In campaign, both must pass. 
-        } else if (this.multiplayerMode === 'casual') {
-            const isLast = this.mpCurrentLevelIdx >= this.mpLevelQueue.length - 1;
-            btnNext.textContent = isLast ? 'VIEW FINAL RESULTS' : 'NEXT BATTLE';
+        const winButtons = document.getElementById('winButtons');
+
+        if (this.conn && this.conn.open) {
+            // Hide all buttons in multiplayer to prevent out-of-sync actions
+            winButtons.classList.add('hidden');
+            
+            if (this.multiplayerMode === 'campaign') {
+                const targetH = this.currentLevel.dynamicTarget || (this.terrain ? this.terrain.maxHeight * 0.985 : 100);
+                if (this.remoteHeight < targetH) {
+                    document.getElementById('winContent').innerHTML += `<div id="mpWaitLabel" style="font-size:14px; color:#ff6b9d; margin-top:15px; border-top:1px solid rgba(255,107,157,0.2); padding-top:10px;">WAITING FOR FRIEND TO REACH PEAK...</div>`;
+                } else {
+                    this.startMPWinCountdown();
+                }
+            } else {
+                // Casual: start countdown immediately
+                this.startMPWinCountdown();
+            }
         } else {
+            winButtons.classList.remove('hidden');
             btnNext.textContent = lvl >= TOTAL_LEVELS ? 'ESCAPE THE GRID' : 'NEXT LEVEL';
         }
 
@@ -1551,6 +1808,37 @@ class Game {
                 document.getElementById('winScreen').classList.remove('hidden');
             }
         }, 1200);
+    }
+
+    startMPWinCountdown() {
+        if (this._mpAutoSyncTimer) return;
+        let count = 5;
+        const updateLabel = () => {
+            const existing = document.getElementById('mpCountdown');
+            if (existing) {
+                existing.innerHTML = `TELEPORTING TO NEXT MATCH IN ${count}...`;
+            } else {
+                document.getElementById('winContent').innerHTML += `<div id="mpCountdown" style="font-size:14px; color:#ffcc4e; margin-top:15px; border-top:1px solid rgba(255,204,78,0.2); padding-top:10px;">TELEPORTING TO NEXT MATCH IN ${count}...</div>`;
+            }
+        };
+        
+        const waitLabel = document.getElementById('mpWaitLabel');
+        if (waitLabel) waitLabel.remove();
+        
+        updateLabel();
+        this._mpAutoSyncTimer = setInterval(() => {
+            count--;
+            if (count > 0) {
+                updateLabel();
+            } else {
+                clearInterval(this._mpAutoSyncTimer);
+                this._mpAutoSyncTimer = null;
+                // Only host or campaign leads the transition
+                if (this.isHost || this.multiplayerMode === 'campaign') {
+                    this.goToNextLevel();
+                }
+            }
+        }, 1000);
     }
 
     // --- Compute the optimizer auto-solve path (reuses shared simulation) ---
@@ -1640,12 +1928,25 @@ class Game {
     // --- Go to next level (uses pre-generated terrain if ready) ---
     async goToNextLevel() {
         if (this.conn && this.conn.open) {
-            if (this.multiplayerMode === 'campaign' && this.currentLevel.level === TOTAL_LEVELS) {
-                if (!this.remoteFinishedFinal) {
+            if (this.multiplayerMode === 'campaign') {
+                // In campaign, both must reach the peak
+                const targetH = this.currentLevel.dynamicTarget || (this.terrain ? this.terrain.maxHeight * 0.985 : 100);
+                if (this.remoteHeight < targetH) {
                     this.showHint("WAITING FOR FRIEND TO ESCAPE...");
                     return;
                 }
+                if (this.currentLevel.level === TOTAL_LEVELS && !this.remoteFinishedFinal) {
+                    this.showHint("WAITING FOR FRIEND TO ESCAPE...");
+                    return;
+                }
+            } else if (this.multiplayerMode === 'casual') {
+                if (!this.isHost) {
+                    this.showHint("WAITING FOR HOST TO START NEXT BATTLE...");
+                    return;
+                }
+                this.sendMPData({ type: 'MP_NEXT_LEVEL', index: this.mpCurrentLevelIdx + 1 });
             }
+            
             this.mpCurrentLevelIdx++;
             if (this.mpCurrentLevelIdx < this.mpLevelQueue.length) {
                 this.startMPSync();
@@ -1930,34 +2231,38 @@ class Game {
 
         // --- Grid & Terrain ---
         const gRange = 800;
-        const showTerrain = this.difficulty === 'dummy' || this.state === 'REPLAY' || (this.difficulty === 'normal' && level.dimension === DIM_3D);
+        const alwaysShow = this.state === 'REPLAY'; // Replay always shows everything
 
         if (level.dimension === DIM_1D) {
-            if (showTerrain) {
-                ctx.beginPath();
-                ctx.strokeStyle = isLocal ? 'rgba(78, 204, 163, 0.25)' : 'rgba(255, 107, 157, 0.25)';
-                ctx.lineWidth = 2;
-                for (let px = cam.x - gRange; px <= cam.x + gRange; px += 8) {
-                    const th = this.generator.getHeight(this.terrain, px, playerPos.y, playerPos.z);
-                    const sx = toX(px), sy = toY_1D(px, th);
-                    if (px === cam.x - gRange) ctx.moveTo(sx, sy);
-                    else ctx.lineTo(sx, sy);
-                }
-                ctx.stroke();
+            ctx.beginPath();
+            ctx.strokeStyle = isLocal ? 'rgba(78, 204, 163, 0.25)' : 'rgba(255, 107, 157, 0.25)';
+            ctx.lineWidth = 2;
+            for (let px = cam.x - gRange; px <= cam.x + gRange; px += 8) {
+                const gx = Math.floor(px / 50), gy = Math.floor(playerPos.y / 50);
+                const isRevealed = alwaysShow || (gx >= 0 && gx < 100 && gy >= 0 && gy < 100 && this.revealedGrid[gx + gy * 100]);
+                if (!isRevealed) continue;
+
+                const th = this.generator.getHeight(this.terrain, px, playerPos.y, playerPos.z);
+                const sx = toX(px), sy = toY_1D(px, th);
+                if (px === cam.x - gRange) ctx.moveTo(sx, sy);
+                else ctx.lineTo(sx, sy);
             }
+            ctx.stroke();
         } else if (level.dimension === DIM_2D) {
-            if (showTerrain) {
-                const cellSize = 20;
-                for (let sx = 0; sx < w; sx += cellSize) {
-                    for (let sy = 0; sy < h; sy += cellSize) {
-                        const wx = cam.x + (sx - w / 2) / zoom;
-                        const wy = cam.y - (sy - h / 2) / zoom;
-                        const th = this.generator.getHeight(this.terrain, wx, wy, playerPos.z);
-                        const ratio = Math.min(1, th / (this.terrain.maxHeight || 100));
-                        const hue = isLocal ? ratio * 120 : (ratio * 120 + 200) % 360;
-                        ctx.fillStyle = `hsla(${hue}, 70%, ${15 + ratio * 35}%, 0.4)`;
-                        ctx.fillRect(sx, sy, cellSize, cellSize);
-                    }
+            const cellSize = 20;
+            for (let sx = 0; sx < w; sx += cellSize) {
+                for (let sy = 0; sy < h; sy += cellSize) {
+                    const wx = cam.x + (sx - w / 2) / zoom;
+                    const wy = cam.y - (sy - h / 2) / zoom;
+                    const gx = Math.floor(wx / 50), gy = Math.floor(wy / 50);
+                    const isRevealed = alwaysShow || (gx >= 0 && gx < 100 && gy >= 0 && gy < 100 && this.revealedGrid[gx + gy * 100]);
+                    if (!isRevealed) continue;
+
+                    const th = this.generator.getHeight(this.terrain, wx, wy, playerPos.z);
+                    const ratio = Math.min(1, th / (this.terrain.maxHeight || 100));
+                    const hue = isLocal ? ratio * 120 : (ratio * 120 + 200) % 360;
+                    ctx.fillStyle = `hsla(${hue}, 70%, ${15 + ratio * 35}%, 0.4)`;
+                    ctx.fillRect(sx, sy, cellSize, cellSize);
                 }
             }
         }
@@ -2053,26 +2358,25 @@ class Game {
             const centerA2 = this.pos[slice.ax2];
 
             // Draw heatmap (hidden in hard mode unless replaying)
-            const showSliceHeatmap = this.difficulty !== 'hard' || this.state === 'REPLAY';
-            if (showSliceHeatmap) {
-                for (let sx = 0; sx < w; sx += cellSize) {
-                    for (let sy = 0; sy < h; sy += cellSize) {
-                        const a1 = centerA1 + (sx - w / 2) / w * range * 2;
-                        const a2 = centerA2 - (sy - h / 2) / h * range * 2;
-                        const coords = { x: this.pos.x, y: this.pos.y, z: this.pos.z };
-                        coords[slice.ax1] = a1;
-                        coords[slice.ax2] = a2;
-                        const th = this.generator.getHeight(this.terrain, coords.x, coords.y, coords.z);
-                        const ratio = Math.min(1, th / (this.terrain.maxHeight || 100));
-                        const hue = ratio * 120;
-                        ctx.fillStyle = `hsla(${hue}, 70%, ${12 + ratio * 40}%, 0.8)`;
-                        ctx.fillRect(sx, sy, cellSize, cellSize);
-                    }
+            const alwaysShow = this.state === 'REPLAY';
+            for (let sx = 0; sx < w; sx += cellSize) {
+                for (let sy = 0; sy < h; sy += cellSize) {
+                    const a1 = centerA1 + (sx - w / 2) / w * range * 2;
+                    const a2 = centerA2 - (sy - h / 2) / h * range * 2;
+                    const coords = { x: this.pos.x, y: this.pos.y, z: this.pos.z };
+                    coords[slice.ax1] = a1;
+                    coords[slice.ax2] = a2;
+
+                    const gx = Math.floor(coords.x / 50), gy = Math.floor(coords.y / 50);
+                    const isRevealed = alwaysShow || (gx >= 0 && gx < 100 && gy >= 0 && gy < 100 && this.revealedGrid[gx + gy * 100]);
+                    if (!isRevealed) continue;
+
+                    const th = this.generator.getHeight(this.terrain, coords.x, coords.y, coords.z);
+                    const ratio = Math.min(1, th / (this.terrain.maxHeight || 100));
+                    const hue = ratio * 120;
+                    ctx.fillStyle = `hsla(${hue}, 70%, ${12 + ratio * 40}%, 0.8)`;
+                    ctx.fillRect(sx, sy, cellSize, cellSize);
                 }
-            } else {
-                // Hard mode: dark background for slices
-                ctx.fillStyle = 'rgba(0, 10, 20, 0.9)';
-                ctx.fillRect(0, 0, w, h);
             }
 
             // Draw visited points on this slice (semi-transparent for points not on this exact slice)
